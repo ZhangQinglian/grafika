@@ -18,15 +18,16 @@ package com.android.grafika;
 
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
+import android.media.MediaCodec;
 import android.opengl.GLES20;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.util.Log;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
-import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.app.Activity;
@@ -35,10 +36,14 @@ import com.android.grafika.gles.EglCore;
 import com.android.grafika.gles.FullFrameRect;
 import com.android.grafika.gles.Texture2dProgram;
 import com.android.grafika.gles.WindowSurface;
+import com.android.grafika.mediacodec.SurfaceRenderer;
+import com.android.grafika.mediacodec.VideoDecoder;
+import com.android.grafika.mediacodec.VideoEncoder;
 
 import java.io.File;
 import java.io.IOException;
 import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
 
 /**
  * Demonstrates capturing video into a ring buffer.  When the "capture" button is clicked,
@@ -56,8 +61,8 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         SurfaceTexture.OnFrameAvailableListener {
     private static final String TAG = MainActivity.TAG;
 
-    private static final int VIDEO_WIDTH = 1280;  // dimensions for 720p video
-    private static final int VIDEO_HEIGHT = 720;
+    private static final int VIDEO_WIDTH = 480;  // dimensions for 720p video
+    private static final int VIDEO_HEIGHT = 360;
     private static final int DESIRED_PREVIEW_FPS = 15;
 
     private EglCore mEglCore;
@@ -72,12 +77,16 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
     private int mCameraPreviewThousandFps;
 
     private File mOutputFile;
-    private CircularEncoder mCircEncoder;
     private WindowSurface mEncoderSurface;
     private boolean mFileSaveInProgress;
 
     private MainHandler mHandler;
     private float mSecondsOfVideo;
+    
+    VideoEncoder mEncoder;
+    VideoDecoder mDecoder;
+    
+    SurfaceView mSurfaceView;
 
     /**
      * Custom message handler for main UI thread.
@@ -85,7 +94,7 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
      * Used to handle camera preview "frame available" notifications, and implement the
      * blinking "recording" text.  Receives callback messages from the encoder thread.
      */
-    private static class MainHandler extends Handler implements CircularEncoder.Callback {
+    private static class MainHandler extends Handler  {
         public static final int MSG_BLINK_TEXT = 0;
         public static final int MSG_FRAME_AVAILABLE = 1;
         public static final int MSG_FILE_SAVE_COMPLETE = 2;
@@ -95,19 +104,6 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
 
         public MainHandler(ContinuousCaptureActivity activity) {
             mWeakActivity = new WeakReference<ContinuousCaptureActivity>(activity);
-        }
-
-        // CircularEncoder.Callback, called on encoder thread
-        @Override
-        public void fileSaveComplete(int status) {
-            sendMessage(obtainMessage(MSG_FILE_SAVE_COMPLETE, status, 0, null));
-        }
-
-        // CircularEncoder.Callback, called on encoder thread
-        @Override
-        public void bufferStatus(long totalTimeMsec) {
-            sendMessage(obtainMessage(MSG_BUFFER_STATUS,
-                    (int) (totalTimeMsec >> 32), (int) totalTimeMsec));
         }
 
 
@@ -172,6 +168,15 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         mOutputFile = new File(getFilesDir(), "continuous-capture.mp4");
         mSecondsOfVideo = 0.0f;
         updateControls();
+        
+
+        mEncoder = new MyEncoder();
+        mDecoder = new VideoDecoder();
+        
+        mSurfaceView = (SurfaceView) findViewById(R.id.continuousCapture_surfaceView_mirror);
+        mDecoder.start();
+        mEncoder.start();
+       
     }
 
     @Override
@@ -189,10 +194,6 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
 
         releaseCamera();
 
-        if (mCircEncoder != null) {
-            mCircEncoder.shutdown();
-            mCircEncoder = null;
-        }
         if (mCameraTexture != null) {
             mCameraTexture.release();
             mCameraTexture = null;
@@ -262,6 +263,9 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         // Set the preview aspect ratio.
         AspectFrameLayout layout = (AspectFrameLayout) findViewById(R.id.continuousCapture_afl);
         layout.setAspectRatio((double) cameraPreviewSize.width / cameraPreviewSize.height);
+        
+        AspectFrameLayout layout_mirror = (AspectFrameLayout) findViewById(R.id.continuousCapture_afl_mirror);
+        layout_mirror.setAspectRatio((double) cameraPreviewSize.width / cameraPreviewSize.height);
     }
 
     /**
@@ -284,12 +288,6 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         TextView tv = (TextView) findViewById(R.id.capturedVideoDesc_text);
         tv.setText(str);
 
-        boolean wantEnabled = (mCircEncoder != null) && !mFileSaveInProgress;
-        Button button = (Button) findViewById(R.id.capture_button);
-        if (button.isEnabled() != wantEnabled) {
-            Log.d(TAG, "setting enabled = " + wantEnabled);
-            button.setEnabled(wantEnabled);
-        }
     }
 
     /**
@@ -310,8 +308,6 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         String str = getString(R.string.nowSaving);
         tv.setText(str);
 
-
-        mCircEncoder.saveVideo(mOutputFile);
     }
 
     /**
@@ -374,17 +370,8 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
             throw new RuntimeException(ioe);
         }
         mCamera.startPreview();
-
-        // TODO: adjust bit rate based on frame rate?
-        // TODO: adjust video width/height based on what we're getting from the camera preview?
-        //       (can we guarantee that camera preview size is compatible with AVC video encoder?)
-        try {
-            mCircEncoder = new CircularEncoder(VIDEO_WIDTH, VIDEO_HEIGHT, 6000000,
-                    mCameraPreviewThousandFps / 1000, 7, mHandler);
-        } catch (IOException ioe) {
-            throw new RuntimeException(ioe);
-        }
-        mEncoderSurface = new WindowSurface(mEglCore, mCircEncoder.getInputSurface(), true);
+        //TODO getinput serface
+        mEncoderSurface = new WindowSurface(mEglCore, mEncoder.getInputSurface(), true);
 
         updateControls();
     }
@@ -444,7 +431,7 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
             GLES20.glViewport(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
             mFullFrameBlit.drawFrame(mTextureId, mTmpMatrix);
             drawExtra(mFrameNum, VIDEO_WIDTH, VIDEO_HEIGHT);
-            mCircEncoder.frameAvailableSoon();
+           // mCircEncoder.frameAvailableSoon();
             mEncoderSurface.setPresentationTime(mCameraTexture.getTimestamp());
             mEncoderSurface.swapBuffers();
         }
@@ -469,5 +456,58 @@ public class ContinuousCaptureActivity extends Activity implements SurfaceHolder
         GLES20.glScissor(xpos, 0, width / 32, height / 32);
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST);
+    }
+    
+    
+    class MyEncoder extends VideoEncoder {
+
+        SurfaceRenderer mRenderer;
+        byte[] mBuffer = new byte[0];
+
+        public MyEncoder() {
+            super(VIDEO_WIDTH, VIDEO_HEIGHT);
+        }
+
+        // Both of onSurfaceCreated and onSurfaceDestroyed are called from codec's thread,
+        // non-UI thread
+
+        @Override
+        protected void onSurfaceCreated(Surface surface) {
+        }
+
+        @Override
+        protected void onSurfaceDestroyed(Surface surface) {
+        }
+
+        @Override
+        protected void onEncodedSample(MediaCodec.BufferInfo info, ByteBuffer data) {
+            // Here we could have just used ByteBuffer, but in real life case we might need to
+            // send sample over network, etc. This requires byte[]
+            if (mBuffer.length < info.size) {
+                mBuffer = new byte[info.size];
+            }
+            Log.d("scott", "frame size = " + info.size);
+            data.position(info.offset);
+            data.limit(info.offset + info.size);
+            data.get(mBuffer, 0, info.size);
+
+            if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == MediaCodec.BUFFER_FLAG_CODEC_CONFIG) {
+                // this is the first and only config sample, which contains information about codec
+                // like H.264, that let's configure the decoder
+                mDecoder.configure(mSurfaceView.getHolder().getSurface(),
+                                   VIDEO_WIDTH,
+                                   VIDEO_HEIGHT,
+                                   mBuffer,
+                                   0,
+                                   info.size);
+            } else {
+                // pass byte[] to decoder's queue to render asap
+                mDecoder.decodeSample(mBuffer,
+                                      0,
+                                      info.size,
+                                      info.presentationTimeUs,
+                                      info.flags);
+            }
+        }
     }
 }
